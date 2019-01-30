@@ -1,4 +1,13 @@
 ﻿-----------------------------------------
+Version 3.6
+-----------------------------------------
+- Fixed: Added null checking to WriteSyncData
+- Fixed: Set `connected` to `false` after CallException sets both Sockets to `null`.
+- Removed: Removed no_async_connection option for connect.
+- Added: Connection Configuration for AsyncOnly, SyncOnly or Both.
+- Fixed: DRY'd the creation of TCP Sockets via `createTCPClient` method.
+
+-----------------------------------------
 Version 3.5
 -----------------------------------------
 - Fixed: Exception is not triggered when synchonous channel is disabled

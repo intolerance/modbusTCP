@@ -72,10 +72,11 @@ namespace ModbusTCP
 
         // ------------------------------------------------------------------------
         // Private declarations
-        private static ushort _timeout = 500;
-        private static ushort _refresh = 10;
-        private static bool _connected = false;
-        private static bool _no_sync_connection = false;
+        private ushort _timeout = 500;
+        private ushort _refresh = 10;
+        private bool _connected = false;
+        private bool _no_sync_connection = false;
+        private ConnectionTypes _connection_config = ConnectionTypes.SyncOnly;
 
         private Socket tcpAsyCl;
         private byte[] tcpAsyClBuffer = new byte[2048];
@@ -114,9 +115,28 @@ namespace ModbusTCP
         // ------------------------------------------------------------------------
         /// <summary>Displays the state of the synchronous channel</summary>
         /// <value>True if channel was diabled during connection.</value>
-        public bool NoSyncConnection
+        public ConnectionTypes ConnectionConfiguration
         {
-            get { return _no_sync_connection; }
+            get { return _connection_config; }
+        }
+
+        /// <summary>
+        /// Define which type of connections to use.
+        /// </summary>
+        public enum ConnectionTypes
+        {
+            /// <summary>
+            /// Use Asynchronous connection only
+            /// </summary>
+            AsyncOnly = 0,
+            /// <summary>
+            /// Use Synchronous connection only
+            /// </summary>
+            SyncOnly = 1,
+            /// <summary>
+            /// Use both Asynchronous and Synchronous connections
+            /// </summary>
+            Both = 2,
         }
 
         // ------------------------------------------------------------------------
@@ -138,30 +158,46 @@ namespace ModbusTCP
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
         public Master(string ip, ushort port)
         {
-            connect(ip, port, false);
+            connect(ip, port, ConnectionTypes.SyncOnly);
         }
 
         // ------------------------------------------------------------------------
         /// <summary>Create master instance with parameters.</summary>
         /// <param name="ip">IP adress of modbus slave.</param>
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
-        /// <param name="no_sync_connection">Disable sencond connection for synchronous requests</param>
-        public Master(string ip, ushort port, bool no_sync_connection)
+        /// <param name="connectionCofiguration">The configured connection type(s).</param>
+        public Master(string ip, ushort port, ConnectionTypes connectionCofiguration)
         {
-            connect(ip, port, no_sync_connection);
+            connect(ip, port, connectionCofiguration);
+        }
+
+        /// <summary>
+        /// Creates a TCPClient (Socket) using the properties given.
+        /// </summary>
+        /// <param name="ip">IP adress of modbus slave.</param>
+        /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
+        /// <returns></returns>
+        private Socket createTCPClient(string ip, ushort port)
+        {
+            Socket tcpClient = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            tcpClient.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
+            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, _timeout);
+            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, _timeout);
+            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, 1);
+            return tcpClient;
         }
 
         // ------------------------------------------------------------------------
         /// <summary>Start connection to slave.</summary>
         /// <param name="ip">IP adress of modbus slave.</param>
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
-        /// <param name="no_sync_connection">Disable sencond connection for synchronous requests</param>
-        public void connect(string ip, ushort port, bool no_sync_connection)
+        /// <param name="connectionCofiguration">The configured connection type(s).</param>
+        public void connect(string ip, ushort port, ConnectionTypes connectionCofiguration)
         {
             try
             {
                 IPAddress _ip;
-                _no_sync_connection = no_sync_connection;
+                _connection_config = connectionCofiguration;
                 if (IPAddress.TryParse(ip, out _ip) == false)
                 {
                     IPHostEntry hst = Dns.GetHostEntry(ip);
@@ -169,24 +205,21 @@ namespace ModbusTCP
                 }
                 // ----------------------------------------------------------------
                 // Connect asynchronous client
-                tcpAsyCl = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                tcpAsyCl.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
-                tcpAsyCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, _timeout);
-                tcpAsyCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, _timeout);
-                tcpAsyCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, 1);
+                if(connectionCofiguration == ConnectionTypes.AsyncOnly || connectionCofiguration == ConnectionTypes.Both)
+                {
+                    tcpAsyCl = createTCPClient(ip, port);
+                }
+
                 // ----------------------------------------------------------------
                 // Connect synchronous client
-                if (!_no_sync_connection)
+                if (connectionCofiguration == ConnectionTypes.SyncOnly || connectionCofiguration == ConnectionTypes.Both)
                 {
-                    tcpSynCl = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                    tcpSynCl.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
-                    tcpSynCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, _timeout);
-                    tcpSynCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, _timeout);
-                    tcpSynCl.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, 1);
+                    tcpSynCl = createTCPClient(ip, port);
                 }
+
                 _connected = true;
             }
-            catch (System.IO.IOException error)
+            catch (Exception error)
             {
                 _connected = false;
                 throw (error);
@@ -238,10 +271,11 @@ namespace ModbusTCP
             if ((tcpAsyCl == null) || (tcpSynCl == null && !_no_sync_connection)) return;
             if (exception == excExceptionConnectionLost)
             {
+                _connected = false;
                 tcpSynCl = null;
                 tcpAsyCl = null;
             }
-            if(OnException != null) OnException(id, unit, function, exception);
+            if (OnException != null) OnException(id, unit, function, exception);
         }
 
         internal static UInt16 SwapUInt16(UInt16 inValue)
@@ -423,7 +457,7 @@ namespace ModbusTCP
         public void WriteMultipleCoils(ushort id, byte unit, ushort startAddress, ushort numBits, byte[] values)
         {
             ushort numBytes = Convert.ToUInt16(values.Length);
-            if(numBytes > 250 || numBits > 2000)
+            if (numBytes > 250 || numBits > 2000)
             {
                 CallException(id, unit, fctWriteMultipleCoils, excIllegalDataVal);
                 return;
@@ -686,7 +720,7 @@ namespace ModbusTCP
                 {
                     tcpAsyCl.BeginSend(write_data, 0, write_data.Length, SocketFlags.None, new AsyncCallback(OnSend), null);
                 }
-                catch (SystemException)
+                catch (Exception)
                 {
                     CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
                 }
@@ -700,7 +734,7 @@ namespace ModbusTCP
         {
             Int32 size = tcpAsyCl.EndSend(result);
             if (result.IsCompleted == false) CallException(0xFFFF, 0xFF, 0xFF, excSendFailt);
-            else tcpAsyCl.BeginReceive(tcpAsyClBuffer, 0, tcpAsyClBuffer.Length, SocketFlags.None, new AsyncCallback(OnReceive), tcpAsyCl);
+            else tcpAsyCl?.BeginReceive(tcpAsyClBuffer, 0, tcpAsyClBuffer.Length, SocketFlags.None, new AsyncCallback(OnReceive), tcpAsyCl);
         }
 
         // ------------------------------------------------------------------------
@@ -708,7 +742,7 @@ namespace ModbusTCP
         private void OnReceive(System.IAsyncResult result)
         {
             tcpAsyCl.EndReceive(result);
-            if (result.IsCompleted == false) CallException(0xFF, 0xFF, 0xFF,excExceptionConnectionLost);
+            if (result.IsCompleted == false) CallException(0xFF, 0xFF, 0xFF, excExceptionConnectionLost);
 
             ushort id = SwapUInt16(BitConverter.ToUInt16(tcpAsyClBuffer, 0));
             byte unit = tcpAsyClBuffer[6];
@@ -746,13 +780,13 @@ namespace ModbusTCP
         private byte[] WriteSyncData(byte[] write_data, ushort id)
         {
 
-            if (tcpSynCl.Connected)
+            if ((tcpSynCl != null) && (tcpSynCl.Connected))
             {
                 try
                 {
                     tcpSynCl.Send(write_data, 0, write_data.Length, SocketFlags.None);
                     int result = tcpSynCl.Receive(tcpSynClBuffer, 0, tcpSynClBuffer.Length, SocketFlags.None);
-                    
+
                     byte unit = tcpSynClBuffer[6];
                     byte function = tcpSynClBuffer[7];
                     byte[] data;
