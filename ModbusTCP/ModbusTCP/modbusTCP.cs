@@ -5,6 +5,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Diagnostics;
 
 namespace ModbusTCP
 {
@@ -75,8 +76,28 @@ namespace ModbusTCP
         private ushort _timeout = 500;
         private ushort _refresh = 10;
         private bool _connected = false;
-        private bool _no_sync_connection = false;
+        private bool _attempting_reconnect = false;
+
+        /// <summary>
+        /// IP Address for the connection.
+        /// </summary>
+        private string _connection_ip = null;
+        /// <summary>
+        /// Port for the connection.
+        /// </summary>
+        private ushort _connection_port;
+        /// <summary>
+        /// Connection configuration.
+        /// </summary>
         private ConnectionTypes _connection_config = ConnectionTypes.SyncOnly;
+        /// <summary>
+        /// If the connection should reconnect automatically if disconnected.
+        /// </summary>
+        private bool _connection_auto_reconnect;
+        /// <summary>
+        /// Maximum amount of attempts to reconnect allowed. (Default is 100).
+        /// </summary>
+        private ushort _connection_auto_reconnect_attempts = (ushort)100;
 
         private Socket tcpAsyCl;
         private byte[] tcpAsyClBuffer = new byte[2048];
@@ -93,6 +114,14 @@ namespace ModbusTCP
         public delegate void ExceptionData(ushort id, byte unit, byte function, byte exception);
         /// <summary>Exception data event. This event is called when the data is incorrect</summary>
         public event ExceptionData OnException;
+        /// <summary>Connection Established Event. This event is called when the connection has been established.</summary>
+        public delegate void OnConnectedEvent(string ip, ushort port);
+        /// <summary>Connection Established Event. This event is called when the connection has been established.</summary>
+        public event OnConnectedEvent OnConnected;
+        /// <summary>Disconnected Event. This event is called when the connection has been lost.</summary>
+        public delegate void DisconnectedEvent(string ip, ushort port, byte unit);
+        /// <summary>Disconnected Event. This event is called when the connection has been lost.</summary>
+        public event DisconnectedEvent OnDisconnected;
 
         // ------------------------------------------------------------------------
         /// <summary>Response timeout. If the slave didn't answers within in this time an exception is called.</summary>
@@ -110,6 +139,25 @@ namespace ModbusTCP
         {
             get { return _refresh; }
             set { _refresh = value; }
+        }
+
+        // ------------------------------------------------------------------------
+        /// <summary>
+        /// If the connection was configured to be automatically reconnected upon disconnect or not.
+        /// </summary>
+        public bool AutoReconnect
+        {
+            get { return _connection_auto_reconnect; }
+        }
+
+        // ------------------------------------------------------------------------
+        /// <summary>
+        /// The maximum amount of reconnection attempts.
+        /// </summary>
+        public ushort AutoReconnectMaxAttempts
+        {
+            get { return _connection_auto_reconnect_attempts; }
+            set { _connection_auto_reconnect_attempts = value; }
         }
 
         // ------------------------------------------------------------------------
@@ -140,6 +188,14 @@ namespace ModbusTCP
         }
 
         // ------------------------------------------------------------------------
+        /// <summary>Displays the state of the synchronous channel</summary>
+        /// <value>True if channel was diabled during connection.</value>
+        public bool NoSyncConnection
+        {
+            get { return _connection_config != ConnectionTypes.SyncOnly ? true : false; }
+        }
+
+        // ------------------------------------------------------------------------
         /// <summary>Shows if a connection is active.</summary>
         public bool connected
         {
@@ -158,7 +214,7 @@ namespace ModbusTCP
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
         public Master(string ip, ushort port)
         {
-            connect(ip, port, ConnectionTypes.SyncOnly);
+            connect(ip, port, ConnectionTypes.Both, false);
         }
 
         // ------------------------------------------------------------------------
@@ -166,9 +222,31 @@ namespace ModbusTCP
         /// <param name="ip">IP adress of modbus slave.</param>
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
         /// <param name="connectionCofiguration">The configured connection type(s).</param>
-        public Master(string ip, ushort port, ConnectionTypes connectionCofiguration)
+        /// <param name="autoReconnect">If the connection should attempt to reconnect upon disconnect.</param>
+        public Master(string ip, ushort port, ConnectionTypes connectionCofiguration, bool autoReconnect)
         {
-            connect(ip, port, connectionCofiguration);
+            connect(ip, port, connectionCofiguration, autoReconnect);
+        }
+
+
+        // ------------------------------------------------------------------------
+        /// <summary>Create master instance with parameters.</summary>
+        /// <param name="ip">IP adress of modbus slave.</param>
+        /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
+        /// <param name="no_sync_connection">Disable sencond connection for synchronous requests</param>
+        public Master(string ip, ushort port, bool no_sync_connection)
+        {
+            connect(ip, port, no_sync_connection ? ConnectionTypes.AsyncOnly : ConnectionTypes.Both, false);
+        }
+
+        // ------------------------------------------------------------------------
+        /// <summary>Start connection to slave.</summary>
+        /// <param name="ip">IP adress of modbus slave.</param>
+        /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
+        /// <param name="no_sync_connection">Disable sencond connection for synchronous requests</param>
+        public void connect(string ip, ushort port, bool no_sync_connection)
+        {
+            connect(ip, port, no_sync_connection ? ConnectionTypes.AsyncOnly : ConnectionTypes.Both, false);
         }
 
         /// <summary>
@@ -177,7 +255,7 @@ namespace ModbusTCP
         /// <param name="ip">IP adress of modbus slave.</param>
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
         /// <returns></returns>
-        private Socket createTCPClient(string ip, ushort port)
+        internal Socket createTCPClient(string ip, ushort port)
         {
             Socket tcpClient = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             tcpClient.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
@@ -192,12 +270,18 @@ namespace ModbusTCP
         /// <param name="ip">IP adress of modbus slave.</param>
         /// <param name="port">Port number of modbus slave. Usually port 502 is used.</param>
         /// <param name="connectionCofiguration">The configured connection type(s).</param>
-        public void connect(string ip, ushort port, ConnectionTypes connectionCofiguration)
+        /// <param name="autoReconnect">If the connection should attempt to reconnect upon disconnect.</param>
+        public void connect(string ip, ushort port, ConnectionTypes connectionCofiguration, bool autoReconnect)
         {
             try
             {
                 IPAddress _ip;
                 _connection_config = connectionCofiguration;
+                // ----------------------------------------------------------------
+                // Reconnect configuration
+                _connection_auto_reconnect = autoReconnect;
+                _connection_ip = ip;
+                _connection_port = port;
                 if (IPAddress.TryParse(ip, out _ip) == false)
                 {
                     IPHostEntry hst = Dns.GetHostEntry(ip);
@@ -205,7 +289,7 @@ namespace ModbusTCP
                 }
                 // ----------------------------------------------------------------
                 // Connect asynchronous client
-                if(connectionCofiguration == ConnectionTypes.AsyncOnly || connectionCofiguration == ConnectionTypes.Both)
+                if (connectionCofiguration == ConnectionTypes.AsyncOnly || connectionCofiguration == ConnectionTypes.Both)
                 {
                     tcpAsyCl = createTCPClient(ip, port);
                 }
@@ -216,13 +300,14 @@ namespace ModbusTCP
                 {
                     tcpSynCl = createTCPClient(ip, port);
                 }
-
+                _attempting_reconnect = false;
                 _connected = true;
+                if (OnConnected != null) OnConnected(ip, port);
+
             }
-            catch (Exception error)
+            catch (Exception)
             {
                 _connected = false;
-                throw (error);
             }
         }
 
@@ -246,7 +331,7 @@ namespace ModbusTCP
         {
             if (tcpAsyCl != null)
             {
-                if (tcpAsyCl.Connected)
+                if (SocketConnected(tcpAsyCl))
                 {
                     try { tcpAsyCl.Shutdown(SocketShutdown.Both); }
                     catch { }
@@ -256,7 +341,7 @@ namespace ModbusTCP
             }
             if (tcpSynCl != null)
             {
-                if (tcpSynCl.Connected)
+                if (SocketConnected(tcpSynCl))
                 {
                     try { tcpSynCl.Shutdown(SocketShutdown.Both); }
                     catch { }
@@ -266,16 +351,58 @@ namespace ModbusTCP
             }
         }
 
+        internal bool SocketConnected(Socket s)
+        {
+            bool part1 = s.Poll(1000, SelectMode.SelectRead);
+            bool part2 = (s.Available == 0);
+            if (part1 && part2)
+                return false;
+            else
+                return true;
+        }
+
         internal void CallException(ushort id, byte unit, byte function, byte exception)
         {
-            if ((tcpAsyCl == null) || (tcpSynCl == null && !_no_sync_connection)) return;
+            if ((tcpAsyCl == null && (_connection_config == ConnectionTypes.AsyncOnly || _connection_config == ConnectionTypes.Both)) || (tcpSynCl == null && (_connection_config == ConnectionTypes.SyncOnly || _connection_config == ConnectionTypes.Both)) || _attempting_reconnect) return;
+
             if (exception == excExceptionConnectionLost)
             {
                 _connected = false;
-                tcpSynCl = null;
-                tcpAsyCl = null;
+                Dispose();
+
+                if (OnException != null) OnException(id, unit, function, exception);
+                if (OnDisconnected != null) OnDisconnected(_connection_ip, _connection_port, unit);
+                if (_connection_auto_reconnect)
+                {
+                    _attempting_reconnect = true;
+                    
+                    ushort attempts = 0;
+
+                    while (!_connected)
+                    {
+                        try
+                        {
+                            if (attempts >= _connection_auto_reconnect_attempts)
+                            {
+                                break;
+                            }
+                            Thread.Sleep(10000);
+                            attempts += 1;
+                            connect(_connection_ip, _connection_port, _connection_config, _connection_auto_reconnect);
+                            
+                        }
+                        catch (Exception)
+                        {   
+                        }
+                        
+                    }
+                    
+                    if (!_connected && OnException != null)
+                    {
+                        OnException(id, unit, function, excExceptionNotConnected);
+                    }
+                }
             }
-            if (OnException != null) OnException(id, unit, function, exception);
         }
 
         internal static UInt16 SwapUInt16(UInt16 inValue)
@@ -714,7 +841,7 @@ namespace ModbusTCP
         // Write asynchronous data
         private void WriteAsyncData(byte[] write_data, ushort id)
         {
-            if ((tcpAsyCl != null) && (tcpAsyCl.Connected))
+            if ((tcpAsyCl != null) && SocketConnected(tcpAsyCl))
             {
                 try
                 {
@@ -780,10 +907,11 @@ namespace ModbusTCP
         private byte[] WriteSyncData(byte[] write_data, ushort id)
         {
 
-            if ((tcpSynCl != null) && (tcpSynCl.Connected))
+            if ((tcpSynCl != null) && SocketConnected(tcpSynCl))
             {
                 try
                 {
+                    
                     tcpSynCl.Send(write_data, 0, write_data.Length, SocketFlags.None);
                     int result = tcpSynCl.Receive(tcpSynClBuffer, 0, tcpSynClBuffer.Length, SocketFlags.None);
 
@@ -817,9 +945,17 @@ namespace ModbusTCP
                     }
                     return data;
                 }
-                catch (SystemException)
+                catch (SocketException s)
                 {
-                    CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
+                    if(s.SocketErrorCode != SocketError.ConnectionAborted && s.SocketErrorCode != SocketError.ConnectionReset)
+                    {
+                        CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
+                    }
+   
+                }
+                catch(Exception)
+                {
+
                 }
             }
             else CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
