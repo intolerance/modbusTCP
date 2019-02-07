@@ -257,12 +257,21 @@ namespace ModbusTCP
         /// <returns></returns>
         internal Socket createTCPClient(string ip, ushort port)
         {
-            Socket tcpClient = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            tcpClient.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
-            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, _timeout);
-            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, _timeout);
-            tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, 1);
-            return tcpClient;
+            try
+            {
+                Socket tcpClient = new Socket(IPAddress.Parse(ip).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                tcpClient.Connect(new IPEndPoint(IPAddress.Parse(ip), port));
+                tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendTimeout, _timeout);
+                tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, _timeout);
+                tcpClient.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, 1);
+                return tcpClient;
+            }
+            catch (Exception)
+            {
+
+                throw;
+            }
+
         }
 
         // ------------------------------------------------------------------------
@@ -275,6 +284,8 @@ namespace ModbusTCP
         {
             try
             {
+                if (_attempting_reconnect) return;
+                _attempting_reconnect = true;
                 IPAddress _ip;
                 _connection_config = connectionCofiguration;
                 // ----------------------------------------------------------------
@@ -307,6 +318,7 @@ namespace ModbusTCP
             }
             catch (Exception)
             {
+                _attempting_reconnect = false;
                 _connected = false;
             }
         }
@@ -315,6 +327,7 @@ namespace ModbusTCP
         /// <summary>Stop connection to slave.</summary>
         public void disconnect()
         {
+            if (_attempting_reconnect) return;
             Dispose();
         }
 
@@ -325,84 +338,106 @@ namespace ModbusTCP
             Dispose();
         }
 
+        internal void ShutdownSocket(ref Socket s)
+        {
+            try
+            {
+                s?.Shutdown(SocketShutdown.Both);
+                s?.Close();
+                s = null;
+            }
+            catch (Exception)
+            {
+
+                throw;
+            }
+
+        }
+
         // ------------------------------------------------------------------------
         /// <summary>Destroy master instance</summary>
         public void Dispose()
         {
-            if (tcpAsyCl != null)
+            if (_attempting_reconnect) return;
+
+            switch (_connection_config)
             {
-                if (SocketConnected(tcpAsyCl))
-                {
-                    try { tcpAsyCl.Shutdown(SocketShutdown.Both); }
-                    catch { }
-                    tcpAsyCl.Close();
-                }
-                tcpAsyCl = null;
-            }
-            if (tcpSynCl != null)
-            {
-                if (SocketConnected(tcpSynCl))
-                {
-                    try { tcpSynCl.Shutdown(SocketShutdown.Both); }
-                    catch { }
-                    tcpSynCl.Close();
-                }
-                tcpSynCl = null;
+                case ConnectionTypes.AsyncOnly:
+                    ShutdownSocket(ref tcpAsyCl);
+                    break;
+                case ConnectionTypes.SyncOnly:
+                    ShutdownSocket(ref tcpSynCl);
+                    break;
+                case ConnectionTypes.Both:
+                    ShutdownSocket(ref tcpAsyCl);
+                    ShutdownSocket(ref tcpSynCl);
+                    break;
+                default:
+                    break;
             }
         }
 
-        internal bool SocketConnected(Socket s)
+        internal bool SocketConnected(ref Socket s)
         {
-            bool part1 = s.Poll(1000, SelectMode.SelectRead);
-            bool part2 = (s.Available == 0);
-            if (part1 && part2)
+            try
+            {
+                if (!s.Connected) return false;
+
+                bool part1 = s.Poll(1000, SelectMode.SelectRead);
+                bool part2 = (s.Available == 0);
+                if (part1 && part2)
+                    return false;
+                else
+                    return true;
+            }
+            catch (Exception)
+            {
+
                 return false;
-            else
-                return true;
+            }
         }
 
         internal void CallException(ushort id, byte unit, byte function, byte exception)
         {
-            if ((tcpAsyCl == null && (_connection_config == ConnectionTypes.AsyncOnly || _connection_config == ConnectionTypes.Both)) || (tcpSynCl == null && (_connection_config == ConnectionTypes.SyncOnly || _connection_config == ConnectionTypes.Both)) || _attempting_reconnect) return;
+            if (_attempting_reconnect || !_connected) return;
 
-            if (exception == excExceptionConnectionLost)
+            _connected = false;
+            Dispose();
+
+            if (OnException != null) OnException(id, unit, function, exception);
+            if (OnDisconnected != null) OnDisconnected(_connection_ip, _connection_port, unit);
+            if (_connection_auto_reconnect)
             {
-                _connected = false;
-                Dispose();
 
-                if (OnException != null) OnException(id, unit, function, exception);
-                if (OnDisconnected != null) OnDisconnected(_connection_ip, _connection_port, unit);
-                if (_connection_auto_reconnect)
+                ushort attempts = 0;
+
+                while (!_connected)
                 {
-                    _attempting_reconnect = true;
-                    
-                    ushort attempts = 0;
-
-                    while (!_connected)
+                    try
                     {
-                        try
+                        if (attempts >= _connection_auto_reconnect_attempts)
                         {
-                            if (attempts >= _connection_auto_reconnect_attempts)
-                            {
-                                break;
-                            }
-                            Thread.Sleep(10000);
-                            attempts += 1;
-                            connect(_connection_ip, _connection_port, _connection_config, _connection_auto_reconnect);
-                            
+                            break;
                         }
-                        catch (Exception)
-                        {   
-                        }
-                        
+
+                        Thread.Sleep(30000);
+                        attempts += 1;
+                        Debug.WriteLine($"Connection attempt {attempts.ToString()}");
+                        connect(_connection_ip, _connection_port, _connection_config, _connection_auto_reconnect);
+
                     }
-                    
-                    if (!_connected && OnException != null)
+                    catch (Exception)
                     {
-                        OnException(id, unit, function, excExceptionNotConnected);
                     }
+
+                }
+
+                if (!_connected && OnException != null)
+                {
+                    OnException(id, unit, function, excExceptionNotConnected);
                 }
             }
+
         }
 
         internal static UInt16 SwapUInt16(UInt16 inValue)
@@ -841,7 +876,7 @@ namespace ModbusTCP
         // Write asynchronous data
         private void WriteAsyncData(byte[] write_data, ushort id)
         {
-            if ((tcpAsyCl != null) && SocketConnected(tcpAsyCl))
+            if ((tcpAsyCl != null) && SocketConnected(ref tcpAsyCl))
             {
                 try
                 {
@@ -907,11 +942,11 @@ namespace ModbusTCP
         private byte[] WriteSyncData(byte[] write_data, ushort id)
         {
 
-            if ((tcpSynCl != null) && SocketConnected(tcpSynCl))
+            if ((tcpSynCl != null) && SocketConnected(ref tcpSynCl))
             {
                 try
                 {
-                    
+
                     tcpSynCl.Send(write_data, 0, write_data.Length, SocketFlags.None);
                     int result = tcpSynCl.Receive(tcpSynClBuffer, 0, tcpSynClBuffer.Length, SocketFlags.None);
 
@@ -945,16 +980,10 @@ namespace ModbusTCP
                     }
                     return data;
                 }
-                catch (SocketException s)
+                catch (Exception)
                 {
-                    if(s.SocketErrorCode != SocketError.ConnectionAborted && s.SocketErrorCode != SocketError.ConnectionReset)
-                    {
-                        CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
-                    }
-   
-                }
-                catch(Exception)
-                {
+
+                    CallException(id, write_data[6], write_data[7], excExceptionConnectionLost);
 
                 }
             }
